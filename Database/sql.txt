@@ -1,0 +1,573 @@
+/*
+Third party SQLite Wrapper
+From https://gist.githubusercontent.com/oswjk/9117138/raw/1ec179dc21492cfbac5ebc6b9f4d35a740942c10/sqlite.cpp
+
+To use:
+
+#include "sql.cpp"
+*/
+
+
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cstdarg>
+
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+
+#include <sqlite3.h>
+
+#define DEBUG_STR(S)
+#define DEBUG_FMT(FMT, ...)
+
+
+namespace sqlite
+{
+    struct cursor;
+
+    struct connection
+    {
+        connection(const std::string &database, int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+
+        ~connection();
+
+        bool is_open() const;
+
+        bool is_ok() const;
+
+        bool close(bool force = false);
+
+        sqlite::cursor *cursor();
+
+        int errcode() const;
+        const char *errmsg() const;
+
+        sqlite3_int64 last_insert_rowid() const;
+
+        sqlite3 *db;
+        int flags;
+        int err;
+
+    private:
+
+        connection();
+        connection(const connection &);
+    };
+
+    struct row
+    {
+        row();
+        row(sqlite::cursor *c);
+        row(const row &other);
+
+        row &operator=(row other);
+
+        void swap(row &lhs, row &rhs);
+
+        operator bool() const;
+
+        int column_count() const;
+
+        int column_type(int col) const;
+
+        const char *column_name(int col) const;
+
+        int get_bytes(int col) const;
+        int get_int(int col) const;
+        const char *get_text(int col) const;
+
+        // int get_int(const std::string &name);
+        // const char *get_text(const std::string &name);
+
+        sqlite::cursor *cursor;
+    };
+
+    struct cursor
+    {
+        ~cursor();
+
+        bool execute(const std::string &statement);
+        bool execute(const std::string &statement, const char *bindfmt, ...);
+
+        row next();
+
+        bool prepare(const std::string &statement);
+        bool bindv(const char *fmt, va_list);
+        bool bind(const char *fmt, ...);
+
+        bool reset();
+
+        bool clear_bindings();
+
+        connection *get_connection() const;
+
+        connection *conn;
+        sqlite3_stmt *stmt;
+        int err;
+        std::string sql;
+        int state;
+
+    private:
+
+        cursor(connection *conn);
+
+        void finalize();
+        void fetch_column_names(sqlite::row row);
+
+        std::vector<std::string> col_names;
+
+        friend struct connection;
+    };
+}
+
+
+
+
+
+
+
+
+namespace sqlite
+{
+
+    connection::connection(const std::string &database, int flags) :
+        db(0),
+        flags(flags)
+    {
+        err = sqlite3_open_v2(database.c_str(), &db, flags, NULL);
+        DEBUG_FMT("err: %d", err);
+    }
+
+    connection::~connection()
+    {
+        close(true);
+    }
+
+    bool connection::is_open() const
+    {
+        return db != 0;
+    }
+
+    bool connection::is_ok() const
+    {
+        return errcode() == SQLITE_OK;
+    }
+
+    bool connection::close(bool force)
+    {
+        // TODO: force
+
+        if (!db)
+            return true;
+
+        if ((err = sqlite3_close(db)) != SQLITE_OK)
+            return false;
+
+        return true;
+    }
+
+    sqlite::cursor *connection::cursor()
+    {
+        if (is_open() && is_ok())
+            return new sqlite::cursor(this);
+
+        return 0;
+    }
+
+    int connection::errcode() const
+    {
+        return err;
+    }
+
+    const char *connection::errmsg() const
+    {
+        return sqlite3_errstr(err);
+    }
+
+    sqlite3_int64 connection::last_insert_rowid() const
+    {
+        return sqlite3_last_insert_rowid(db);
+    }
+
+
+
+    row::row() :
+        cursor(0)
+    {}
+
+    row::row(sqlite::cursor *c) :
+        cursor(c)
+    {}
+
+    row::row(const row &other) :
+        cursor(other.cursor)
+    {}
+
+    row &row::operator=(row other)
+    {
+        swap(*this, other);
+        return *this;
+    }
+
+    void row::swap(row &lhs, row &rhs)
+    {
+        std::swap(lhs.cursor, rhs.cursor);
+    }
+
+    row::operator bool() const
+    {
+        return cursor != 0;
+    }
+
+    int row::column_count() const
+    {
+        if (!cursor)
+            return 0;
+
+        return sqlite3_column_count(cursor->stmt);
+    }
+
+    int row::column_type(int col) const
+    {
+        if (!cursor)
+            return 0;
+
+        return sqlite3_column_type(cursor->stmt, col);
+    }
+
+    const char *row::column_name(int col) const
+    {
+        if (!cursor)
+            return 0;
+
+        return sqlite3_column_name(cursor->stmt, col);
+    }
+
+    int row::get_bytes(int col) const
+    {
+        if (!cursor)
+            return 0;
+
+        return sqlite3_column_bytes(cursor->stmt, col);
+    }
+
+    int row::get_int(int col) const
+    {
+        if (!cursor)
+            return 0;
+
+        return sqlite3_column_int(cursor->stmt, col);
+    }
+
+    const char *row::get_text(int col) const
+    {
+        if (!cursor)
+            return 0;
+
+        return (const char *) sqlite3_column_text(cursor->stmt, col);
+    }
+
+
+
+
+
+
+    cursor::cursor(connection *conn) :
+        conn(conn),
+        stmt(0),
+        err(SQLITE_OK),
+        state(-1)
+    {
+        DEBUG_STR("");
+    }
+
+    cursor::~cursor()
+    {
+        DEBUG_STR("");
+        finalize();
+    }
+
+    bool cursor::execute(const std::string &statement)
+    {
+        if (!prepare(statement))
+            return false;
+
+        sqlite::row row = next();
+
+        return err == SQLITE_DONE || err == SQLITE_ROW;
+    }
+
+    bool cursor::execute(const std::string &statement, const char *bindfmt, ...)
+    {
+        va_list ap;
+
+        if (!prepare(statement))
+            return false;
+
+        DEBUG_STR("start binding");
+
+        va_start(ap, bindfmt);
+        bool ret = bindv(bindfmt, ap);
+        va_end(ap);
+
+        if (!ret)
+        {
+            DEBUG_STR("binding failed");
+            return false;
+        }
+
+        sqlite::row row = next();
+
+        return err == SQLITE_DONE || err == SQLITE_ROW;
+    }
+
+    row cursor::next()
+    {
+    again:
+
+        switch (state)
+        {
+        case -1:
+            state = 0;
+            err = sqlite3_step(stmt);
+            break;
+
+        case 1:
+            err = sqlite3_step(stmt);
+            break;
+
+        case 0:
+            state = 1;
+            break;
+        }
+
+        if (col_names.empty() && state == 0 && err == SQLITE_ROW)
+        {
+            fetch_column_names(row(this));
+        }
+
+        switch (err)
+        {
+        case SQLITE_DONE:
+            // DEBUG_STR("DONE");
+            return row();
+            break;
+
+        case SQLITE_ROW:
+            // DEBUG_STR("ROW");
+            return row(this);
+            break;
+
+        case SQLITE_BUSY:
+            // DEBUG_STR("BUSY");
+            goto again;
+            break;
+
+        default:
+            // DEBUG_STR("ERROR?");
+            return row();
+            break;
+        }
+    }
+
+    connection *cursor::get_connection() const
+    {
+        return conn;
+    }
+
+    bool cursor::prepare(const std::string &statement)
+    {
+        DEBUG_FMT("stmt: <%s>", statement.c_str());
+
+        finalize();
+
+        col_names.clear();
+
+        state = -1;
+
+        sql = statement;
+
+        int rc = sqlite3_prepare_v2(conn->db, sql.c_str(),
+            sql.size(), &stmt, NULL);
+
+        DEBUG_FMT("err: %d %s", rc, sqlite3_errstr(rc));
+
+        return rc == SQLITE_OK;
+    }
+
+    bool cursor::bindv(const char *fmt, va_list ap)
+    {
+        char c;
+        int altformat = 0;
+        int idx = 0;
+        int len = -1;
+
+        enum
+        {
+            ALT_L = 0x1,
+            ALT_WIDTH = 0x2
+        };
+
+        DEBUG_FMT("bindfmt: <%s>", fmt);
+
+        while ((c = *fmt++) != '\0')
+        {
+            len = -1;
+            altformat = 0;
+
+            // skip whitespace
+            if (isspace(c))
+                continue;
+
+            // if there's something other than %
+            if (c != '%')
+                goto literal;
+
+again:
+            switch (c = *fmt++)
+            {
+            // %%
+            case '%':
+literal:
+                return false;
+
+            // field width
+            case '.':
+                altformat |= ALT_WIDTH;
+                c = *fmt++;
+                if (c == '*')
+                {
+                    len = va_arg(ap, int);
+                    // DEBUG_FMT("field width from next arg: %d", len);
+                    goto again;
+                }
+                else if (isdigit(c))
+                {
+                    char *endptr;
+                    len = strtol(fmt-1, &endptr, 10);
+                    fmt = endptr;
+                    // DEBUG_FMT("field width from fmtstr: %d", len);
+                    goto again;
+                }
+                return false;
+
+            // int64 specifier for 'd'
+            // utf16 specifier for 's'
+            case 'l':
+                // DEBUG_STR("ALT_L");
+                altformat |= ALT_L;
+                goto again;
+
+            // int / int64
+            case 'd':
+                if (altformat & (~ALT_L))
+                {
+                    int val = va_arg(ap, int);
+                    sqlite3_bind_int(stmt, idx++, val);
+                }
+                else
+                {
+                    sqlite3_int64 val = va_arg(ap, sqlite3_int64);
+                    sqlite3_bind_int64(stmt, idx++, val);
+                }
+                continue;
+
+            // double
+            case 'f':
+                {
+                    double val = va_arg(ap, double);
+                    sqlite3_bind_double(stmt, idx++, val);
+                }
+                continue;
+
+            // utf-8 string
+            case 's':
+                {
+                    if (altformat & ALT_L)
+                    {
+                        void *val = va_arg(ap, void *);
+                        // DEBUG_STR("binding utf-16 str");
+                        sqlite3_bind_text16(stmt, idx++, val, len, SQLITE_TRANSIENT);
+                    }
+                    else
+                    {
+                        char *val = va_arg(ap, char *);
+                        // DEBUG_FMT("binding utf-8 str <%.*s>", (len < 0) ? strlen(val) : len, val);
+                        sqlite3_bind_text(stmt, idx++, val, len, SQLITE_TRANSIENT);
+                    }
+                }
+                continue;
+
+            // zeroblob
+            case 'z':
+                // DEBUG_FMT("binding zeroblob of len %d", len);
+                sqlite3_bind_zeroblob(stmt, idx++, len);
+                continue;
+
+            // null
+            case 'n':
+                // DEBUG_STR("binding null");
+                sqlite3_bind_null(stmt, idx++);
+                continue;
+
+            // blob
+            // case 'b':
+            //     DEBUG_STR("binding blob");
+            //     sqlite3_bind_blob(stmt, idx++, )
+
+            // unknown conversion specifier
+            default:
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool cursor::bind(const char *fmt, ...)
+    {
+        va_list ap;
+        va_start(ap, fmt);
+        bool ret = bindv(fmt, ap);
+        va_end(ap);
+        return ret;
+    }
+
+    void cursor::finalize()
+    {
+        if (stmt)
+        {
+            DEBUG_STR("finalizing previous stmt");
+            sqlite3_finalize(stmt);
+            stmt = 0;
+        }
+    }
+
+    void cursor::fetch_column_names(sqlite::row row)
+    {
+        col_names.clear();
+        for (int i = 0; i < row.column_count(); ++i)
+        {
+            const char *p = row.column_name(i);
+            std::string name;
+            if (p)
+                name.assign(p);
+            col_names.push_back(name);
+            DEBUG_FMT("colname: %d <%s>", i, p);
+        }
+    }
+
+    bool cursor::reset()
+    {
+        return sqlite3_reset(stmt) == SQLITE_OK;
+    }
+
+    bool cursor::clear_bindings()
+    {
+        return sqlite3_clear_bindings(stmt) == SQLITE_OK;
+    }
+
+}
